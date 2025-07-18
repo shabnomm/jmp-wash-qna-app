@@ -1,0 +1,7 @@
+streamlit
+PyMuPDF
+transformers
+sentence-transformers
+torch
+huggingface_hub
+scikit-learn
