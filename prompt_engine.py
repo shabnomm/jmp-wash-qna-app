@@ -1,89 +1,135 @@
 import os
+import re
 from langdetect import detect
 from googletrans import Translator
 from transformers import pipeline
+from explanation_dict import EXPLANATIONS
 
 # Initialize translator
 translator = Translator()
 
-# Initialize local QA pipeline (ensure model downloaded or auto-downloads)
-local_qa = pipeline("question-answering", model="deepset/roberta-base-squad2")
+# Multilingual QA model
+qa_pipeline = pipeline(
+    "question-answering",
+    model="deepset/roberta-base-squad2",
+    tokenizer="deepset/roberta-base-squad2"
+)
 
-# Cache dictionary for answered questions
+# Cache for performance
 qa_cache = {}
 
-# Global variable for uploaded large text context (update this from your app if needed)
+# Global variable for uploaded context text
 uploaded_text = None
 
 def translate_to_english(text):
-    """Translate input text to English"""
     return translator.translate(text, src='auto', dest='en').text
 
 def translate_to_bangla(text):
-    """Translate input text to Bangla"""
     return translator.translate(text, src='auto', dest='bn').text
 
 def generate_cache_key(text):
-    """Generate a simple cache key from the question text"""
     return text.lower().strip()
 
-def get_context_from_text(long_text, question, max_len=512):
-    """
-    Extract context chunk from long text.
-    This is a simple approach returning the first max_len chars.
-    You can improve with semantic search or chunking later.
-    """
-    # TODO: Improve with semantic similarity search if desired
-    return long_text[:max_len]
+def get_best_context_chunks(long_text, question, max_len=512, top_n=2):
+    lines = long_text.split('. ')
+    question_keywords = set(question.lower().split())
+
+    scored_lines = []
+    for line in lines:
+        line_words = set(line.lower().split())
+        score = len(question_keywords & line_words)
+        if score > 0:
+            scored_lines.append((score, line))
+
+    scored_lines.sort(key=lambda x: x[0], reverse=True)
+    best_lines = [line for score, line in scored_lines[:top_n]]
+
+    combined = ". ".join(best_lines)
+    return combined[:max_len] if combined else long_text[:max_len]
 
 def query_fallback_model(prompt):
-    """
-    Placeholder for fallback LLM call.
-    Implement external API call here (HuggingFace, OpenAI, etc.)
-    For now, returns a fixed response.
-    """
     return "Sorry, I could not find a precise answer."
 
+def get_glossary_explanation(question_en):
+    """
+    Return matched glossary explanation if any keyword matches as a whole word
+    """
+    for keyword, texts in EXPLANATIONS.items():
+        pattern = rf'\b{re.escape(keyword.lower())}\b'
+        if re.search(pattern, question_en.lower()):
+            return texts.get("en", "")
+    return ""
+
+def prepare_context(question_en, context=None):
+    global uploaded_text
+
+    if context is not None:
+        return context
+    elif uploaded_text:
+        lang = detect(uploaded_text)
+        if lang == 'bn':
+            text_context_en = translate_to_english(uploaded_text)
+        else:
+            text_context_en = uploaded_text
+        return get_best_context_chunks(text_context_en, question_en)
+    else:
+        # Default fallback context
+        return (
+            "Clean water is water that is safe to drink and free from harmful contaminants. "
+            "Sanitation refers to the provision of facilities and services for the safe disposal of human urine and feces."
+        )
+
+import re
+
 def generate_answer(question, context=None):
-    """
-    Main function to generate answer for a question.
-    Uses local QA model first, falls back to external LLM.
-    Handles translation between Bangla and English.
-    """
     lang = detect(question)
-    
     question_en = translate_to_english(question) if lang != 'en' else question
     cache_key = generate_cache_key(question_en)
 
+    print(f"🧠 Detected language: {lang}")
+    print(f"🔎 Question (EN): {question_en}")
+
+    # Check glossary match first (top priority)
+    for keyword, texts in EXPLANATIONS.items():
+        pattern = rf'\b{re.escape(keyword.lower())}\b'
+        if re.search(pattern, question_en.lower()):
+            # Return glossary explanation exactly in the question's language
+            if lang == 'bn' and 'bn' in texts:
+                print("📚 Matched glossary keyword, returning Bangla explanation.")
+                return texts['bn']
+            else:
+                print("📚 Matched glossary keyword, returning English explanation.")
+                return texts.get('en', "Sorry, no explanation available.")
+
+    # If no glossary match, check cache or run QA model as before
     if cache_key in qa_cache:
         print("🔁 Returning cached result")
         answer_en = qa_cache[cache_key]
     else:
-        # Build or use provided context
         if context is None:
             if uploaded_text:
-                context = get_context_from_text(uploaded_text, question_en)
+                text_context = get_best_context_chunks(uploaded_text, question_en)
             else:
-                context = (
+                text_context = (
                     "Clean water is water that is safe to drink and free from harmful contaminants. "
                     "Sanitation refers to the provision of facilities and services for the safe disposal of human urine and feces."
                 )
+        else:
+            text_context = context
+
         try:
-            # Query local QA pipeline
-            result = local_qa(question=question_en, context=context)
+            result = qa_pipeline(question=question_en, context=text_context)
             answer_en = result.get("answer", "").strip()
-            # Fallback if local answer is weak or empty
+
             if not answer_en or answer_en.lower() in ["", "no answer", "unknown"]:
-                raise ValueError("Local model returned weak answer.")
+                raise ValueError("Weak answer from QA model")
+
         except Exception as e:
-            print(f"⚠️ Local model failed: {e}")
-            prompt = f"Answer the following question clearly and concisely:\n\nQuestion: {question_en}\n\nContext: {context}\n\nAnswer:"
-            answer_en = query_fallback_model(prompt)
+            print(f"⚠️ QA failed: {e}")
+            fallback_prompt = f"Answer the following question:\n\nQuestion: {question_en}\n\nContext: {text_context}"
+            answer_en = query_fallback_model(fallback_prompt)
 
         qa_cache[cache_key] = answer_en
 
-    # Translate back if original question was not English
-    if lang != 'en':
-        return translate_to_bangla(answer_en)
-    else:
-        return answer_en
+    # Translate answer to Bangla only if original question was not in English
+    return translate_to_bangla(answer_en) if lang != 'en' else answer_en
