@@ -1,5 +1,6 @@
 import os
 import re
+import requests
 from langdetect import detect
 from googletrans import Translator
 from transformers import pipeline
@@ -8,17 +9,14 @@ from explanation_dict import EXPLANATIONS
 # Initialize translator
 translator = Translator()
 
-# Multilingual QA model
+# QA pipeline
 qa_pipeline = pipeline(
     "question-answering",
     model="deepset/roberta-base-squad2",
     tokenizer="deepset/roberta-base-squad2"
 )
 
-# Cache for performance
 qa_cache = {}
-
-# Global variable for uploaded context text
 uploaded_text = None
 
 def translate_to_english(text):
@@ -43,27 +41,33 @@ def get_best_context_chunks(long_text, question, max_len=512, top_n=2):
 
     scored_lines.sort(key=lambda x: x[0], reverse=True)
     best_lines = [line for score, line in scored_lines[:top_n]]
-
     combined = ". ".join(best_lines)
-    return combined[:max_len] if combined else long_text[:max_len]
 
-def query_fallback_model(prompt):
-    return "Sorry, I could not find a precise answer."
+    if len(combined) < max_len // 2:
+        combined = long_text[:max_len]
 
-def get_glossary_explanation(question_en):
-    """
-    Return matched glossary explanation if any keyword matches as a whole word
-    """
-    for keyword, texts in EXPLANATIONS.items():
-        pattern = rf'\b{re.escape(keyword.lower())}\b'
-        if re.search(pattern, question_en.lower()):
-            return texts.get("en", "")
-    return ""
+    return combined[:max_len]
+
+def query_llm_fallback(prompt):
+    url = "https://api-inference.huggingface.co/models/HuggingFaceH4/zephyr-7b-alpha"
+    headers = {"Content-Type": "application/json"}
+    payload = {
+        "inputs": prompt,
+        "parameters": {"temperature": 0.5, "max_new_tokens": 150}
+    }
+    try:
+        r = requests.post(url, headers=headers, json=payload, timeout=15)
+        r.raise_for_status()
+        response = r.json()
+        return response[0]["generated_text"].split("Answer:")[-1].strip()
+    except Exception as e:
+        print("⚠️ LLM fallback failed:", e)
+        return "Sorry, I could not find a precise answer."
 
 def prepare_context(question_en, context=None):
     global uploaded_text
 
-    if context is not None:
+    if context:
         return context
     elif uploaded_text:
         lang = detect(uploaded_text)
@@ -73,13 +77,10 @@ def prepare_context(question_en, context=None):
             text_context_en = uploaded_text
         return get_best_context_chunks(text_context_en, question_en)
     else:
-        # Default fallback context
         return (
             "Clean water is water that is safe to drink and free from harmful contaminants. "
             "Sanitation refers to the provision of facilities and services for the safe disposal of human urine and feces."
         )
-
-import re
 
 def generate_answer(question, context=None):
     lang = detect(question)
@@ -89,33 +90,22 @@ def generate_answer(question, context=None):
     print(f"🧠 Detected language: {lang}")
     print(f"🔎 Question (EN): {question_en}")
 
-    # Check glossary match first (top priority)
+    # ✅ 1. Glossary answer first
     for keyword, texts in EXPLANATIONS.items():
         pattern = rf'\b{re.escape(keyword.lower())}\b'
         if re.search(pattern, question_en.lower()):
-            # Return glossary explanation exactly in the question's language
+            print("📚 Matched glossary keyword.")
             if lang == 'bn' and 'bn' in texts:
-                print("📚 Matched glossary keyword, returning Bangla explanation.")
                 return texts['bn']
             else:
-                print("📚 Matched glossary keyword, returning English explanation.")
-                return texts.get('en', "Sorry, no explanation available.")
+                return texts.get('en', "No explanation available.")
 
-    # If no glossary match, check cache or run QA model as before
+    # ✅ 2. Cache
     if cache_key in qa_cache:
         print("🔁 Returning cached result")
         answer_en = qa_cache[cache_key]
     else:
-        if context is None:
-            if uploaded_text:
-                text_context = get_best_context_chunks(uploaded_text, question_en)
-            else:
-                text_context = (
-                    "Clean water is water that is safe to drink and free from harmful contaminants. "
-                    "Sanitation refers to the provision of facilities and services for the safe disposal of human urine and feces."
-                )
-        else:
-            text_context = context
+        text_context = prepare_context(question_en, context)
 
         try:
             result = qa_pipeline(question=question_en, context=text_context)
@@ -126,10 +116,9 @@ def generate_answer(question, context=None):
 
         except Exception as e:
             print(f"⚠️ QA failed: {e}")
-            fallback_prompt = f"Answer the following question:\n\nQuestion: {question_en}\n\nContext: {text_context}"
-            answer_en = query_fallback_model(fallback_prompt)
+            fallback_prompt = f"Question: {question_en}\nContext: {text_context}\nAnswer:"
+            answer_en = query_llm_fallback(fallback_prompt)
 
         qa_cache[cache_key] = answer_en
 
-    # Translate answer to Bangla only if original question was not in English
     return translate_to_bangla(answer_en) if lang != 'en' else answer_en
